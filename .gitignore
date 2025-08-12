@@ -1,0 +1,135 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+pip-wheel-metadata/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.pyenv/
+.python-version
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+.pytype/
+.mypy_cache/
+.pylint.d/
+.ruff_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Databases
+db.sqlite3
+db.sqlite3-journal
+
+# Flask/Django
+instance/
+local_settings.py
+.webassets-cache
+
+# Sphinx docs
+docs/_build/
+
+# Jupyter
+.ipynb_checkpoints/
+profile_default/
+.ipython/
+.python_history
+
+# dotenv
+.env
+.env.*
+!.env.example
+
+# Editors/IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Caches / temp
+.tmp/
+tmp/
+temp/
+.arc_cache/
+.cache/
+
+# ML / experiment artifacts
+wandb/
+mlruns/
+lightning_logs/
+tensorboard/
+tb_logs/
+checkpoints/
+runs/
+outputs/
+artifacts/
+models/
+*.ckpt
+*.pt
+*.pth
+
+# Data (customize as needed)
+data/raw/
+data/processed/
+data/interim/
+data/external/
+
+
