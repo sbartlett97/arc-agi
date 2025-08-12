@@ -3,3 +3,4 @@ pytest>=7
 torch
 tqdm
 Pillow>=10
+optuna>=3.6

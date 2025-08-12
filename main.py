@@ -3,6 +3,7 @@ import json
 import math
 import os
 import random
+import shutil
 from typing import List, Tuple, Dict, Any, Optional
 
 import numpy as np
@@ -11,6 +12,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
+try:
+    import optuna  # type: ignore
+except Exception:
+    optuna = None  # type: ignore
 
 class CoordFewShotModel(nn.Module):
     def __init__(self,
@@ -257,7 +262,7 @@ class ARCSyntheticGenerator:
                 if rule == 'color_swap':
                     h,w = inp.shape
                     cx, cy = rng.randint(0,w), rng.randint(0,h)
-                    r = rng.randint(1, min(h,w))
+                    r = rng.randint(1, min(h,w) + 1)
                     c1 = rng.randint(1, num_colors)
                     c2 = rng.randint(1, num_colors)
                     yy, xx = np.ogrid[:h, :w]
@@ -278,7 +283,7 @@ class ARCSyntheticGenerator:
                 elif rule == 'grow':
                     h,w = inp.shape
                     cx, cy = rng.randint(0,w), rng.randint(0,h)
-                    r = rng.randint(0, min(h,w)//2)
+                    r = rng.randint(0, (min(h,w)//2) + 1)
                     c = rng.randint(1, num_colors)
                     yy, xx = np.ogrid[:h, :w]
                     mask = (xx - cx)**2 + (yy - cy)**2 <= r*r
@@ -600,7 +605,8 @@ def train(args):
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    best_exact = 0.0
+    best_exact = float('-inf')
+    saved_any_checkpoint = False
     for epoch in range(args.epochs):
         model.train()
         total_loss = 0.0
@@ -642,10 +648,84 @@ def train(args):
 
         exact, percell = eval_model(model, eval_ds, args, device)
         print(f" Eval exact acc: {exact:.3f}, per-cell acc: {percell:.3f}")
-        if exact > best_exact:
+        if exact >= best_exact:
             best_exact = exact
             torch.save(model.state_dict(), args.checkpoint)
             print('Saved best model')
+            saved_any_checkpoint = True
+
+    # Ensure a checkpoint exists even if no improvement was recorded
+    if not saved_any_checkpoint or not os.path.exists(args.checkpoint):
+        torch.save(model.state_dict(), args.checkpoint)
+        print('Saved final model (no prior best recorded)')
+
+    return best_exact
+
+
+def run_optuna(args):
+    if optuna is None:
+        raise RuntimeError("optuna is not installed. Please install it or add it to requirements.")
+
+    os.makedirs(args.optuna_checkpoint_dir, exist_ok=True)
+
+    direction = 'maximize'
+    sampler = optuna.samplers.TPESampler(seed=getattr(args, 'optuna_seed', None))
+    pruner = optuna.pruners.MedianPruner(n_warmup_steps=getattr(args, 'optuna_warmup_trials', 0))
+
+    study = optuna.create_study(direction=direction, sampler=sampler, pruner=pruner, study_name=getattr(args, 'study_name', None))
+
+    def objective(trial: Any) -> float:
+        # Suggest hyperparameters
+        embed_dim = trial.suggest_categorical('embed_dim', [64, 96, 128, 160])
+        enc_layers = trial.suggest_int('enc_layers', 2, 4)
+        dec_layers = trial.suggest_int('dec_layers', 2, 4)
+        nheads = trial.suggest_categorical('nheads', [4, 8])
+        lr = trial.suggest_float('lr', 1e-4, 3e-3, log=True)
+        support_k = trial.suggest_int('support_k', 1, min(4, args.max_support))
+        max_tokens_per_support = trial.suggest_categorical('max_tokens_per_support', [128, 192, 256, 320])
+        batch = trial.suggest_categorical('batch', [4, 6, 8])
+
+        # Clone args into a simple namespace
+        from copy import deepcopy
+        local_args = deepcopy(args)
+        local_args.embed_dim = embed_dim
+        local_args.enc_layers = enc_layers
+        local_args.dec_layers = dec_layers
+        local_args.nheads = nheads
+        local_args.lr = lr
+        local_args.support_k = support_k
+        local_args.max_tokens_per_support = max_tokens_per_support
+        local_args.batch = batch
+
+        # Trial-specific checkpoint
+        trial_ckpt = os.path.join(args.optuna_checkpoint_dir, f"trial_{trial.number}.pt")
+        local_args.checkpoint = trial_ckpt
+
+        # Optionally shorten runs during tuning
+        if getattr(args, 'optuna_fast_mode', False):
+            local_args.epochs = max(1, args.epochs // 2)
+            local_args.iters_per_epoch = max(1, args.iters_per_epoch // 4)
+            local_args.eval_episodes = max(10, args.eval_episodes // 5)
+
+        best_exact = train(local_args)
+        # Report the final result
+        trial.report(best_exact, step=local_args.epochs)
+        return best_exact
+
+    study.optimize(objective, n_trials=args.optuna_trials, n_jobs=1, show_progress_bar=True)
+
+    print(f"Best value: {study.best_value:.4f}")
+    print(f"Best params: {study.best_trial.params}")
+
+    # Copy best checkpoint to main checkpoint path to ensure it's always saved at a predictable location
+    best_trial_num = study.best_trial.number
+    best_trial_ckpt = os.path.join(args.optuna_checkpoint_dir, f"trial_{best_trial_num}.pt")
+    if not os.path.exists(best_trial_ckpt):
+        raise FileNotFoundError(f"Expected checkpoint for best trial not found: {best_trial_ckpt}")
+    # Ensure destination directory exists
+    os.makedirs(os.path.dirname(args.checkpoint) or '.', exist_ok=True)
+    shutil.copy2(best_trial_ckpt, args.checkpoint)
+    print(f"Saved overall best model to {args.checkpoint}")
 
 
 def eval_model(model: nn.Module, ds: ARCChallengeDataset, args, device):
@@ -719,8 +799,18 @@ def parse_args():
     # Visualization
     p.add_argument('--vis_dir', type=str, default=None, help='Directory to save episode visualizations during eval')
     p.add_argument('--cell_size', type=int, default=16, help='Cell size for visualization images')
+    # Optuna
+    p.add_argument('--optuna_trials', type=int, default=0, help='Number of Optuna trials to run; 0 disables tuning')
+    p.add_argument('--optuna_checkpoint_dir', type=str, default='optuna_checkpoints', help='Directory to store per-trial checkpoints')
+    p.add_argument('--study_name', type=str, default=None, help='Optional Optuna study name')
+    p.add_argument('--optuna_fast_mode', action='store_true', help='Speed up each trial by reducing epochs/iters/eval')
+    p.add_argument('--optuna_seed', type=int, default=None, help='Random seed for Optuna sampler')
+    p.add_argument('--optuna_warmup_trials', type=int, default=0, help='Warmup trials before pruner considers pruning')
     return p.parse_args()
 
 if __name__ == '__main__':
     args = parse_args()
-    train(args)
+    if getattr(args, 'optuna_trials', 0) and args.optuna_trials > 0:
+        run_optuna(args)
+    else:
+        train(args)
