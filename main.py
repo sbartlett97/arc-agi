@@ -6,6 +6,7 @@ import random
 from typing import List, Tuple, Dict, Any, Optional
 
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -112,21 +113,102 @@ class CoordFewShotModel(nn.Module):
 class ARCChallengeDataset:
     def __init__(self, arc_json_path: Optional[str] = None, solutions_json_path: Optional[str] = None):
         self.tasks = {}
+        # Load solutions map if provided
+        solutions_map: Dict[str, Any] = {}
+        if solutions_json_path and os.path.exists(solutions_json_path):
+            with open(solutions_json_path, 'r') as fsol:
+                try:
+                    solutions_map = json.load(fsol)
+                except Exception:
+                    solutions_map = {}
+
         if arc_json_path and os.path.exists(arc_json_path):
             with open(arc_json_path, 'r') as f:
                 obj = json.load(f)
+
+            def is_grid(x: Any) -> bool:
+                # A grid is a list of rows (lists of ints)
+                if not (isinstance(x, list) and len(x) > 0 and isinstance(x[0], list)):
+                    return False
+                # If the inner element is a list of ints (or empty), it's a grid
+                inner = x[0]
+                return len(inner) == 0 or not isinstance(inner[0], list)
+
+            def is_list_of_grids(x: Any) -> bool:
+                # A list of grids is list where first element is itself a grid (list of rows)
+                if not (isinstance(x, list) and len(x) > 0 and isinstance(x[0], list)):
+                    return False
+                inner = x[0]
+                return isinstance(inner, list) and len(inner) > 0 and isinstance(inner[0], list)
+
             for tid, data in obj.items():
-                train_pairs = []
-                for v in data.get('train', []):
-                    inp = np.array(v['input'], dtype=np.int64)
-                    out = np.array(v['output'], dtype=np.int64)
-                    train_pairs.append((inp, out))
-                test_inputs = []
+                # Parse train pairs; accept either list or dict forms
+                train_pairs: List[Tuple[np.ndarray, np.ndarray]] = []
+                train_section = data.get('train', [])
+                if isinstance(train_section, dict):
+                    train_iterable = train_section.values()
+                elif isinstance(train_section, list):
+                    train_iterable = train_section
+                else:
+                    train_iterable = []
+
+                for example in train_iterable:
+                    if not isinstance(example, dict):
+                        continue
+                    if 'input' in example and 'output' in example:
+                        inp = np.array(example['input'], dtype=np.int64)
+                        out = np.array(example['output'], dtype=np.int64)
+                        train_pairs.append((inp, out))
+
+                # Parse test inputs; accept classic ARC format or ARC-AGI simplification
+                test_inputs: List[np.ndarray] = []
                 tsec = data.get('test', [])
-               
-                for item in tsec:
-                    test_inputs.append(np.array(item['input'], dtype=np.int64))
-                self.tasks[tid] = {'train_pairs': train_pairs, 'test_inputs': test_inputs}
+                if isinstance(tsec, list):
+                    if len(tsec) > 0 and isinstance(tsec[0], dict) and 'input' in tsec[0]:
+                        for item in tsec:
+                            test_inputs.append(np.array(item['input'], dtype=np.int64))
+                    elif is_grid(tsec):
+                        # Single test grid directly as a 2D array
+                        test_inputs.append(np.array(tsec, dtype=np.int64))
+                    else:
+                        # Unknown list structure; ignore
+                        pass
+                elif isinstance(tsec, dict):
+                    if 'input' in tsec:
+                        test_inputs.append(np.array(tsec['input'], dtype=np.int64))
+                else:
+                    # No test section or unrecognized format
+                    pass
+
+                # Parse test solutions if present
+                test_solutions: List[np.ndarray] = []
+                if tid in solutions_map:
+                    sols = solutions_map[tid]
+                    # Solutions may be a single grid or a list of grids
+                    if is_grid(sols):
+                        test_solutions = [np.array(sols, dtype=np.int64)]
+                    elif is_list_of_grids(sols):
+                        for s in sols:
+                            if is_grid(s):
+                                test_solutions.append(np.array(s, dtype=np.int64))
+                    elif isinstance(sols, list):
+                        # Defensive: iterate and collect any grids inside
+                        for s in sols:
+                            if is_grid(s):
+                                test_solutions.append(np.array(s, dtype=np.int64))
+                    # else: ignore unknown formats
+
+                # Align lengths of inputs and solutions if both exist
+                if len(test_inputs) > 0 and len(test_solutions) > 0:
+                    L = min(len(test_inputs), len(test_solutions))
+                    test_inputs = test_inputs[:L]
+                    test_solutions = test_solutions[:L]
+
+                self.tasks[tid] = {
+                    'train_pairs': train_pairs,
+                    'test_inputs': test_inputs,
+                    'test_solutions': test_solutions,
+                }
 
         self.task_ids = list(self.tasks.keys())
 
@@ -139,12 +221,20 @@ class ARCChallengeDataset:
         train_pairs = task['train_pairs']
         S = min(support_k, len(train_pairs))
         supports = random.sample(train_pairs, S)
-        # choose query: prefer test_inputs
-        if len(task.get('test_inputs', [])) > 0:
-            q_in = task['test_inputs'][0]
-            q_out = None
+        # choose query: prefer test inputs only when solutions are available; otherwise, use held-out train pair
+        test_inputs = task.get('test_inputs', [])
+        test_solutions = task.get('test_solutions', [])
+        if len(test_inputs) > 0 and len(test_solutions) > 0:
+            idx = random.randrange(min(len(test_inputs), len(test_solutions)))
+            q_in = test_inputs[idx]
+            q_out = test_solutions[idx]
         else:
-            remaining = [p for p in train_pairs if p not in supports]
+            # choose a held-out training pair if possible
+            remaining = []
+            support_set = set(id(p[0]) for p in supports)  # compare by object id to avoid ndarray truth issues
+            for p in train_pairs:
+                if id(p[0]) not in support_set:
+                    remaining.append(p)
             if len(remaining) > 0:
                 q = random.choice(remaining)
                 q_in, q_out = q[0], q[1]
@@ -249,6 +339,7 @@ def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max
     query_qy = []
     query_targets = []
 
+    episode_details: List[Dict[str, Any]] = []
     for b in range(B):
         supports, (q_in, q_out) = ds.sample_episode(support_k)
         # per-episode color permutation augmentation
@@ -256,6 +347,7 @@ def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max
         np.random.shuffle(perm)
 
         # process supports
+        supports_perm: List[Tuple[np.ndarray, np.ndarray]] = []
         for s_idx in range(support_k):
             if s_idx < len(supports):
                 inp, out = supports[s_idx]
@@ -263,6 +355,7 @@ def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max
                 # apply perm
                 inp = perm[inp]
                 out = perm[out]
+                supports_perm.append((inp.copy(), out.copy()))
                 # convert to tokens for the input -> it's useful to include both input and output tokens
                 xs_in, ys_in, cols_in = grid_to_coord_tokens(inp)
                 xs_out, ys_out, cols_out = grid_to_coord_tokens(out)
@@ -294,6 +387,13 @@ def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max
         # query tokens (we use the output shape if available; else fallback to input shape)
         if q_out is not None:
             tgt = perm[q_out]
+            # Ensure target is 2D grid [H, W]
+            if tgt.ndim == 3:
+                # Some loaders may wrap as [1, H, W]
+                if tgt.shape[0] == 1:
+                    tgt = tgt[0]
+                else:
+                    tgt = tgt.squeeze()
             h_t, w_t = tgt.shape
             qx = [];
             qy = []; tgt_flat = []
@@ -305,6 +405,8 @@ def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max
             query_qx.append(np.array(qx, dtype=np.int64))
             query_qy.append(np.array(qy, dtype=np.int64))
             query_targets.append(np.array(tgt_flat, dtype=np.int64))
+            q_in_perm = perm[q_in]
+            q_out_perm = tgt
         else:
             # unknown target; create query from input size (best-effort)
             q_in_p = perm[q_in]
@@ -317,6 +419,16 @@ def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max
             query_qx.append(np.array(qx, dtype=np.int64))
             query_qy.append(np.array(qy, dtype=np.int64))
             query_targets.append(np.array(tgt_flat, dtype=np.int64))
+            q_in_perm = q_in_p
+            q_out_perm = None
+
+        episode_details.append({
+            'supports': supports_perm,
+            'q_in': q_in_perm,
+            'q_out': q_out_perm,
+            'perm': perm,
+            'query_hw': (h_t, w_t),
+        })
 
     # Now convert lists into tensors
     # support_* are lists of length S each containing B arrays of shape [T]
@@ -355,7 +467,106 @@ def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max
     qmask_t = torch.tensor(qmask, dtype=torch.bool, device=device)
     tgt_t = torch.tensor(tgt_p, dtype=torch.long, device=device)
 
-    return support_xs_t, support_ys_t, support_cols_t, support_masks_t, qx_t, qy_t, qmask_t, tgt_t
+    return support_xs_t, support_ys_t, support_cols_t, support_masks_t, qx_t, qy_t, qmask_t, tgt_t, episode_details
+
+
+# Visualization utilities
+ARC_PALETTE = [
+    (0, 0, 0),        # 0 black
+    (0, 116, 217),    # 1 blue
+    (255, 65, 54),    # 2 red
+    (46, 204, 64),    # 3 green
+    (255, 220, 0),    # 4 yellow
+    (170, 170, 170),  # 5 gray
+    (177, 13, 201),   # 6 purple
+    (255, 133, 27),   # 7 orange
+    (255, 153, 204),  # 8 pink
+    (127, 219, 255),  # 9 cyan
+]
+
+
+def render_grid_image(grid: np.ndarray, cell_size: int = 16) -> Image.Image:
+    if grid.ndim != 2:
+        raise ValueError("Grid must be 2D")
+    h, w = grid.shape
+    img = Image.new('RGB', (w * cell_size, h * cell_size), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    for y in range(h):
+        for x in range(w):
+            color_idx = int(grid[y, x])
+            color = ARC_PALETTE[color_idx % len(ARC_PALETTE)]
+            x0 = x * cell_size
+            y0 = y * cell_size
+            draw.rectangle([x0, y0, x0 + cell_size - 1, y0 + cell_size - 1], fill=color)
+    return img
+
+
+def hstack_images(images: List[Image.Image], pad: int = 4, pad_color=(255, 255, 255)) -> Image.Image:
+    heights = [im.height for im in images]
+    max_h = max(heights) if images else 0
+    widths = [im.width for im in images]
+    total_w = sum(widths) + pad * (len(images) - 1 if len(images) > 0 else 0)
+    out = Image.new('RGB', (total_w, max_h), pad_color)
+    x = 0
+    for i, im in enumerate(images):
+        out.paste(im, (x, 0))
+        x += im.width
+        if i < len(images) - 1:
+            x += pad
+    return out
+
+
+def vstack_images(images: List[Image.Image], pad: int = 4, pad_color=(255, 255, 255)) -> Image.Image:
+    widths = [im.width for im in images]
+    max_w = max(widths) if images else 0
+    heights = [im.height for im in images]
+    total_h = sum(heights) + pad * (len(images) - 1 if len(images) > 0 else 0)
+    out = Image.new('RGB', (max_w, total_h), pad_color)
+    y = 0
+    for i, im in enumerate(images):
+        out.paste(im, (0, y))
+        y += im.height
+        if i < len(images) - 1:
+            y += pad
+    return out
+
+
+def label_image(image: Image.Image, label: str) -> Image.Image:
+    draw = ImageDraw.Draw(image)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    text_w = draw.textlength(label, font=font)
+    pad = 2
+    bg = Image.new('RGB', (image.width, 30 + pad * 2), (240, 240, 240))
+    bg_draw = ImageDraw.Draw(bg)
+    bg_draw.text((pad, pad), label, fill=(0, 0, 0), font=font)
+    return vstack_images([bg, image], pad=0)
+
+
+def save_episode_visual(supports: List[Tuple[np.ndarray, np.ndarray]], q_in: np.ndarray, pred: np.ndarray, target: Optional[np.ndarray], out_path: str, cell_size: int = 16):
+    # Row 1..n: support pairs input -> output
+    rows: List[Image.Image] = []
+    for idx, (inp, out) in enumerate(supports):
+        im_in = render_grid_image(inp, cell_size)
+        im_out = render_grid_image(out, cell_size)
+        row = hstack_images([label_image(im_in, f"S{idx} in"), label_image(im_out, f"S{idx} out")], pad=8)
+        rows.append(row)
+
+    # Last row: test input, prediction, and (optional) target
+    im_q = render_grid_image(q_in, cell_size)
+    im_pred = render_grid_image(pred, cell_size)
+    comps = [label_image(im_q, "query in"), label_image(im_pred, "prediction")]
+    if target is not None:
+        im_tgt = render_grid_image(target, cell_size)
+        comps.append(label_image(im_tgt, "target"))
+    last_row = hstack_images(comps, pad=8)
+    rows.append(last_row)
+
+    canvas = vstack_images(rows, pad=8)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    canvas.save(out_path)
 
 
 def train(args):
@@ -398,7 +609,7 @@ def train(args):
 
         with tqdm(range(args.iters_per_epoch), desc=f"Epoch {epoch+1}/{args.epochs}", unit="iter") as pbar:
             for it in pbar:
-                sup_xs_t, sup_ys_t, sup_cols_t, sup_masks_t, qx_t, qy_t, qmask_t, tgt_t = \
+                sup_xs_t, sup_ys_t, sup_cols_t, sup_masks_t, qx_t, qy_t, qmask_t, tgt_t, _ = \
                     build_episode_batch(ds, args.batch, args.support_k, args.max_x, args.max_y, args.num_colors, args.max_tokens_per_support, device)
 
                 logits = model(list(zip(sup_xs_t, sup_ys_t, sup_cols_t)), sup_masks_t, (qx_t, qy_t))  # [B, Qmax, C]
@@ -446,7 +657,7 @@ def eval_model(model: nn.Module, ds: ARCChallengeDataset, args, device):
     with torch.no_grad():
         with tqdm(range(n), desc="Eval", unit="ep") as pbar:
             for _ in pbar:
-                sup_xs_t, sup_ys_t, sup_cols_t, sup_masks_t, qx_t, qy_t, qmask_t, tgt_t = \
+                sup_xs_t, sup_ys_t, sup_cols_t, sup_masks_t, qx_t, qy_t, qmask_t, tgt_t, details = \
                     build_episode_batch(ds, 1, args.support_k, args.max_x, args.max_y, args.num_colors, args.max_tokens_per_support, device)
                 logits = model(list(zip(sup_xs_t, sup_ys_t, sup_cols_t)), sup_masks_t, (qx_t, qy_t))
                 preds = logits.argmax(dim=-1).cpu().numpy()[0]  # [Qmax]
@@ -462,6 +673,24 @@ def eval_model(model: nn.Module, ds: ARCChallengeDataset, args, device):
                 percell_so_far = (correct_cells / total_cells) if total_cells > 0 else 0.0
                 denom = max(pbar.n, 1)
                 pbar.set_postfix({"exact": f"{exact_count/denom:.3f}", "per_cell": f"{percell_so_far:.3f}"})
+
+                # Optional visualization dump
+                if getattr(args, 'vis_dir', None):
+                    det = details[0]
+                    h_t, w_t = det['query_hw']
+                    # reshape preds
+                    pred_grid = np.zeros((h_t, w_t), dtype=np.int64)
+                    qx_np = qx_t.cpu().numpy()[0]
+                    qy_np = qy_t.cpu().numpy()[0]
+                    for i in range(len(qx_np)):
+                        if mask[i]:
+                            pred_grid[qy_np[i], qx_np[i]] = preds[i]
+
+                    target_grid = None
+                    if det['q_out'] is not None:
+                        target_grid = det['q_out']
+                    save_path = os.path.join(args.vis_dir, f"episode_{pbar.n}.png")
+                    save_episode_visual(det['supports'], det['q_in'], pred_grid, target_grid, save_path, cell_size=getattr(args, 'cell_size', 16))
     return exact_count / n, correct_cells / total_cells
 
 
@@ -487,6 +716,9 @@ def parse_args():
     p.add_argument('--eval_solutions_json', type=str, default=None)
     p.add_argument('--checkpoint', type=str, default='coord_fewshot.pt')
     p.add_argument('--eval_episodes', type=int, default=100)
+    # Visualization
+    p.add_argument('--vis_dir', type=str, default=None, help='Directory to save episode visualizations during eval')
+    p.add_argument('--cell_size', type=int, default=16, help='Cell size for visualization images')
     return p.parse_args()
 
 if __name__ == '__main__':
