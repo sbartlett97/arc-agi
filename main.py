@@ -1,30 +1,3 @@
-"""
-Few-shot ARC trainer (coordinate-token variant)
------------------------------------------------
-This script implements a coordinate-token representation for ARC tasks.
-Key ideas:
- - Represent each non-padding cell as a token: (x, y, color_idx)
- - Embed x, y (learned), color (learned) and sum to make token embeddings
- - Support set tokens are encoded into a task memory via a TransformerEncoder
- - Decoder takes a list of coordinate queries (the target grid coordinates) and
-   cross-attends to the task memory to predict a color for each coordinate
- - Supports variable-sized inputs/outputs (we build queries for the true output
-   shape during training/eval)
- - Episodic sampling and per-episode color permutation augmentation included
-
-Usage:
-  python fewshot_arc_coordinate_trainer.py --epochs 10 --batch 8
-
-Notes & limitations:
- - For inference when the true output shape isn't provided you need a
-   separate size-prediction strategy (not implemented here). During training
-   and evaluation we use the ground-truth target size to form decoder queries.
- - This is an experiment-ready baseline; you should extend it with better
-   masking, dataset handling, and dataset path options for large-scale runs.
-
-Author: ChatGPT (for Sam)
-"""
-
 import argparse
 import json
 import math
@@ -38,7 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-# ------------------------- Coordinate-based Few-shot Model ------------------------- #
 class CoordFewShotModel(nn.Module):
     def __init__(self,
                  max_x: int = 30,
@@ -137,7 +109,6 @@ class CoordFewShotModel(nn.Module):
         logits = self.head(dec_out)
         return logits
 
-# ------------------------- Dataset loader & episodic sampling (coordinate tokens) ------------------------- #
 class ARCChallengeDataset:
     def __init__(self, arc_json_path: Optional[str] = None, solutions_json_path: Optional[str] = None):
         self.tasks = {}
@@ -241,7 +212,6 @@ class ARCSyntheticGenerator:
         ds.task_ids = list(ds.tasks.keys())
         return ds
 
-# ----------------------- Helpers: convert grids -> coordinate tokens ----------------------- #
 
 def grid_to_coord_tokens(grid: np.ndarray):
     # returns xs, ys, cols arrays for non-padding cells
@@ -266,7 +236,6 @@ def pad_token_list(arr: np.ndarray, max_len: int, pad_value: int = 0):
     out[:L] = arr
     return out
 
-# ----------------------- Batch builder (with augmentation) ----------------------- #
 
 def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max_x: int, max_y: int, num_colors: int, max_tokens_per_support: int, device: torch.device):
     # For each example in batch, sample an episode and convert supports into token tensors
@@ -388,7 +357,6 @@ def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max
 
     return support_xs_t, support_ys_t, support_cols_t, support_masks_t, qx_t, qy_t, qmask_t, tgt_t
 
-# ------------------------- Training & Evaluation ------------------------- #
 
 def train(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -397,7 +365,7 @@ def train(args):
     # load or synthesize dataset
     if args.arc_json and os.path.exists(args.arc_json):
         ds = ARCChallengeDataset(args.arc_json, args.solutions_json)
-        print(f"Loaded train set with {len(ds)} tasks from {args.eval_json}")
+        print(f"Loaded train set with {len(ds)} tasks from {args.arc_json}")
 
         if len(ds) == 0:
             print('No tasks found in provided JSON. Falling back to synthetic generator')
@@ -496,7 +464,6 @@ def eval_model(model: nn.Module, ds: ARCChallengeDataset, args, device):
                 pbar.set_postfix({"exact": f"{exact_count/denom:.3f}", "per_cell": f"{percell_so_far:.3f}"})
     return exact_count / n, correct_cells / total_cells
 
-# -------------------------- CLI ------------------------- #
 
 def parse_args():
     p = argparse.ArgumentParser()
