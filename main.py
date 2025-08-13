@@ -677,13 +677,13 @@ def run_optuna(args):
     def objective(trial: Any) -> float:
         # Suggest hyperparameters
         embed_dim = trial.suggest_categorical('embed_dim', [64, 96, 128, 160])
-        enc_layers = trial.suggest_int('enc_layers', 2, 4)
-        dec_layers = trial.suggest_int('dec_layers', 2, 4)
+        enc_layers = trial.suggest_int('enc_layers', 2, 6)
+        dec_layers = trial.suggest_int('dec_layers', 2, 6)
         nheads = trial.suggest_categorical('nheads', [4, 8])
         lr = trial.suggest_float('lr', 1e-4, 3e-3, log=True)
         support_k = trial.suggest_int('support_k', 1, min(4, args.max_support))
-        max_tokens_per_support = trial.suggest_categorical('max_tokens_per_support', [128, 192, 256, 320])
-        batch = trial.suggest_categorical('batch', [4, 6, 8])
+        max_tokens_per_support = trial.suggest_categorical('max_tokens_per_support', [128, 192, 256, 320, 384, 448, 512])
+        batch = trial.suggest_categorical('batch', [2, 4, 6, 8])
 
         # Clone args into a simple namespace
         from copy import deepcopy
