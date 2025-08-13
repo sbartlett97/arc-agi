@@ -27,7 +27,9 @@ class CoordFewShotModel(nn.Module):
                  dec_layers: int = 3,
                  nheads: int = 8,
                  max_support: int = 8,
-                 max_tokens_per_support: int = 256):
+                 max_tokens_per_support: int = 256,
+                 max_scale: int = 4,
+                 max_shift: int = 15):
         super().__init__()
         self.max_x = max_x
         self.max_y = max_y
@@ -35,11 +37,16 @@ class CoordFewShotModel(nn.Module):
         self.embed_dim = embed_dim
         self.max_support = max_support
         self.max_tokens_per_support = max_tokens_per_support
+        self.max_scale = max_scale
+        self.max_shift = max_shift
 
         # embeddings
         self.color_emb = nn.Embedding(num_colors, embed_dim)
         self.x_emb = nn.Embedding(max_x, embed_dim)
         self.y_emb = nn.Embedding(max_y, embed_dim)
+
+        # support phase embedding: 0=input token, 1=output token
+        self.support_phase_emb = nn.Embedding(2, embed_dim)
 
         # role embeddings
         self.role_support = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
@@ -56,8 +63,20 @@ class CoordFewShotModel(nn.Module):
         dec_layer = nn.TransformerDecoderLayer(d_model=embed_dim, nhead=nheads, batch_first=True)
         self.decoder = nn.TransformerDecoder(dec_layer, num_layers=dec_layers)
 
-        # head
-        self.head = nn.Linear(embed_dim, num_colors)
+        # heads
+        self.pixel_head = nn.Linear(embed_dim, num_colors)
+        # shape head predicts height and width
+        self.shape_head = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim, (self.max_y + self.max_x))
+        )
+        # affine head over discrete params
+        self.affine_head = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim, (self.max_scale*2) + (2*self.max_shift+1)*2 + 4 + 2 + 2)
+        )
 
     def embed_tokens(self, xs: torch.LongTensor, ys: torch.LongTensor, cols: torch.LongTensor):
         # xs, ys, cols: [*, T] with values in range
@@ -67,53 +86,143 @@ class CoordFewShotModel(nn.Module):
         emb = xe + ye + ce  # [*, T, D]
         return emb
 
-    def build_support_memory(self, support_tokens: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]], support_masks: List[torch.Tensor]):
-        # support_tokens: list length S of (xs, ys, cols) each [B, T_s]
+    def build_support_memory(self, support_tokens: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], support_masks: List[torch.Tensor]):
+        # support_tokens: list length S of (xs, ys, cols, roles) each [B, T_s]
         # support_masks: list length S of [B, T_s] booleans (True for valid tokens)
         B = support_tokens[0][0].shape[0]
         per_support_embs = []
-        per_support_lens = []
-        for idx, (xs, ys, cols) in enumerate(support_tokens):
+        per_support_masks = []
+        for idx, (xs, ys, cols, roles) in enumerate(support_tokens):
             emb = self.embed_tokens(xs, ys, cols)  # [B, T_s, D]
-            emb = emb + self.role_support  # role
+            phase = self.support_phase_emb(roles.clamp_(0,1))
+            emb = emb + phase + self.role_support  # role
             ex_emb = self.example_emb(torch.tensor(idx, device=emb.device)).view(1,1,-1)
             emb = emb + ex_emb
             per_support_embs.append(emb)
-            per_support_lens.append(emb.shape[1])
+            per_support_masks.append(support_masks[idx])
 
         # Concatenate supports along sequence dim -> memory [B, sum(T_s), D]
         memory = torch.cat(per_support_embs, dim=1)
         # Build memory mask: True means valid (following PyTorch transformer convention for key_padding_mask)
-        mem_masks = torch.cat(support_masks, dim=1)  # [B, sum(T_s)]
+        mem_masks = torch.cat(per_support_masks, dim=1)  # [B, sum(T_s)]
         # The TransformerEncoder expects src_key_padding_mask with True at positions that should be masked -> invert
         src_key_padding_mask = ~mem_masks  # True where padding
         memory = self.task_encoder(memory, src_key_padding_mask=src_key_padding_mask)
-        return memory, src_key_padding_mask
+        # pooled memory for global conditioning
+        denom = mem_masks.sum(dim=1, keepdim=True).clamp_min(1)
+        pooled_memory = (memory * mem_masks.unsqueeze(-1)).sum(dim=1) / denom
+        return memory, src_key_padding_mask, pooled_memory
+
+    def apply_affine(self,
+                     qx: torch.Tensor, qy: torch.Tensor,
+                     qh: torch.Tensor, qw: torch.Tensor,
+                     sx: torch.Tensor, sy: torch.Tensor,
+                     tx: torch.Tensor, ty: torch.Tensor,
+                     rot: torch.Tensor, fx: torch.Tensor, fy: torch.Tensor):
+        # Apply discrete affine to (qx,qy). Tensors shapes [B,Q] for qx,qy and [B] for params.
+        B, Q = qx.shape
+        x = qx.float()
+        y = qy.float()
+        # flips
+        if fx is not None:
+            fxv = fx.view(B,1).float()
+            x = torch.where(fxv>0.5, (qw.view(B,1).float()-1 - x), x)
+        if fy is not None:
+            fyv = fy.view(B,1).float()
+            y = torch.where(fyv>0.5, (qh.view(B,1).float()-1 - y), y)
+        # rotations (0,1,2,3)
+        if rot is not None:
+            rv = rot.view(B,1).long()
+            for r in range(4):
+                mask = (rv==r)
+                if mask.any():
+                    idx = mask.squeeze(1)
+                    xi = x[idx]; yi = y[idx]
+                    hi = qh[idx].float(); wi = qw[idx].float()
+                    if r == 1:
+                        x[idx] = (hi-1 - yi)
+                        y[idx] = xi
+                    elif r == 2:
+                        x[idx] = (wi-1 - xi)
+                        y[idx] = (hi-1 - yi)
+                    elif r == 3:
+                        x[idx] = yi
+                        y[idx] = (wi-1 - xi)
+        # scale and translate
+        x = x * sx.view(B,1).float() + tx.view(B,1).float()
+        y = y * sy.view(B,1).float() + ty.view(B,1).float()
+        wx = x.round().clamp(0, self.max_x-1).long()
+        wy = y.round().clamp(0, self.max_y-1).long()
+        return wx, wy
 
     def forward(self,
-                support_tokens: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+                support_tokens: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
                 support_masks: List[torch.Tensor],
-                query_coords: Tuple[torch.Tensor, torch.Tensor]):
+                query_coords: Tuple[torch.Tensor, torch.Tensor],
+                query_mask: torch.Tensor,
+                query_hw: Tuple[torch.Tensor, torch.Tensor]):
         """
-        support_tokens: list of S tuples, each tuple (xs, ys, cols) with shapes [B, T_s]
+        support_tokens: list of S tuples, each tuple (xs, ys, cols, roles) with shapes [B, T_s]
         support_masks: list of S boolean masks [B, T_s]
         query_coords: (qx, qy) each [B, Q]
-        returns logits: [B, Q, num_colors]
+        query_mask: [B, Q] boolean
+        query_hw: (qh, qw) each [B]
+        returns pixel_logits [B, Q, C], h_logits [B, max_y], w_logits [B, max_x], affine_logits dict
         """
         device = support_tokens[0][0].device
-        memory, mem_key_padding = self.build_support_memory(support_tokens, support_masks)
+        memory, mem_key_padding, pooled_memory = self.build_support_memory(support_tokens, support_masks)
 
         qx, qy = query_coords
-        # For queries we don't have a color; use a placeholder zero color index (learned color_emb supports it)
         dummy_cols = torch.zeros_like(qx, dtype=torch.long, device=device)
-        q_emb = self.embed_tokens(qx, qy, dummy_cols) + self.role_query  # [B, Q, D]
+        q_emb_raw = self.embed_tokens(qx, qy, dummy_cols) + self.role_query  # [B, Q, D]
 
-        # PyTorch TransformerDecoder expects tgt_key_padding_mask (False for included tokens)
-        tgt_key_padding_mask = None
-        # memory_key_padding_mask = mem_key_padding
+        # global pooled query context
+        denom_q = query_mask.sum(dim=1, keepdim=True).clamp_min(1)
+        q_ctx = (q_emb_raw * query_mask.unsqueeze(-1)).sum(dim=1) / denom_q  # [B, D]
+        head_in = torch.cat([pooled_memory, q_ctx], dim=-1)  # [B, 2D]
+
+        # shape head
+        shape_logits = self.shape_head(head_in)
+        h_logits = shape_logits[:, : self.max_y]
+        w_logits = shape_logits[:, self.max_y : self.max_y + self.max_x]
+
+        # affine head
+        aff_logits = self.affine_head(head_in)
+        ofs = 0
+        sx_logits = aff_logits[:, ofs:ofs+self.max_scale]; ofs += self.max_scale
+        sy_logits = aff_logits[:, ofs:ofs+self.max_scale]; ofs += self.max_scale
+        tx_logits = aff_logits[:, ofs:ofs+(2*self.max_shift+1)]; ofs += (2*self.max_shift+1)
+        ty_logits = aff_logits[:, ofs:ofs+(2*self.max_shift+1)]; ofs += (2*self.max_shift+1)
+        rot_logits = aff_logits[:, ofs:ofs+4]; ofs += 4
+        fx_logits = aff_logits[:, ofs:ofs+2]; ofs += 2
+        fy_logits = aff_logits[:, ofs:ofs+2]; ofs += 2
+
+        # discrete params for warping
+        sx = torch.argmax(sx_logits, dim=-1) + 1
+        sy = torch.argmax(sy_logits, dim=-1) + 1
+        tx = torch.argmax(tx_logits, dim=-1) - self.max_shift
+        ty = torch.argmax(ty_logits, dim=-1) - self.max_shift
+        rot = torch.argmax(rot_logits, dim=-1)
+        fx = torch.argmax(fx_logits, dim=-1)
+        fy = torch.argmax(fy_logits, dim=-1)
+
+        qh, qw = query_hw
+        wx, wy = self.apply_affine(qx, qy, qh, qw, sx, sy, tx, ty, rot, fx, fy)
+        q_emb = self.embed_tokens(wx, wy, dummy_cols) + self.role_query
+
         dec_out = self.decoder(tgt=q_emb, memory=memory, memory_key_padding_mask=mem_key_padding)
-        logits = self.head(dec_out)
-        return logits
+        pixel_logits = self.pixel_head(dec_out)
+
+        affine_logits = {
+            'sx': sx_logits,
+            'sy': sy_logits,
+            'tx': tx_logits,
+            'ty': ty_logits,
+            'rot': rot_logits,
+            'fx': fx_logits,
+            'fy': fy_logits,
+        }
+        return pixel_logits, h_logits, w_logits, affine_logits
 
 class ARCChallengeDataset:
     def __init__(self, arc_json_path: Optional[str] = None, solutions_json_path: Optional[str] = None):
@@ -308,6 +417,40 @@ class ARCSyntheticGenerator:
         return ds
 
 
+def nonzero_bbox(arr: np.ndarray):
+    ys, xs = np.nonzero(arr)
+    if ys.size == 0:
+        return None
+    return int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+
+
+def estimate_affine_labels(inp: np.ndarray, out: np.ndarray, max_scale: int, max_shift: int):
+    h_in, w_in = inp.shape
+    h_out, w_out = out.shape
+    sy = max(1, min(max_scale, int(round(h_out / max(h_in, 1)))))
+    sx = max(1, min(max_scale, int(round(w_out / max(w_in, 1)))))
+    rot_cls = 0
+    fx_cls = 0
+    fy_cls = 0
+    bb_in = nonzero_bbox(inp)
+    bb_out = nonzero_bbox(out)
+    if bb_in and bb_out:
+        y0_in, _, x0_in, _ = bb_in
+        y0_out, _, x0_out, _ = bb_out
+        ty = (y0_out - sy * y0_in)
+        tx = (x0_out - sx * x0_in)
+    else:
+        ty = 0
+        tx = 0
+    tx = int(np.clip(tx, -max_shift, max_shift))
+    ty = int(np.clip(ty, -max_shift, max_shift))
+    sx_cls = sx - 1
+    sy_cls = sy - 1
+    tx_cls = tx + max_shift
+    ty_cls = ty + max_shift
+    return sx_cls, sy_cls, tx_cls, ty_cls, rot_cls, fx_cls, fy_cls
+
+
 def grid_to_coord_tokens(grid: np.ndarray):
     # returns xs, ys, cols arrays for non-padding cells
     h, w = grid.shape
@@ -332,7 +475,7 @@ def pad_token_list(arr: np.ndarray, max_len: int, pad_value: int = 0):
     return out
 
 
-def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max_x: int, max_y: int, num_colors: int, max_tokens_per_support: int, device: torch.device):
+def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max_x: int, max_y: int, num_colors: int, max_tokens_per_support: int, device: torch.device, max_scale: int = 4, max_shift: int = 15):
     # For each example in batch, sample an episode and convert supports into token tensors
     B = batch
     S_list = []
@@ -340,6 +483,7 @@ def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max
     support_ys = []
     support_cols = []
     support_masks = []
+    support_roles = []
     query_qx = []
     query_qy = []
     query_targets = []
@@ -352,6 +496,12 @@ def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max
         np.random.shuffle(perm)
 
         # process supports
+        # estimate affine labels from the first support pair (before color perm)
+        if len(supports) > 0:
+            s_in0, s_out0 = supports[0]
+            sx_c, sy_c, tx_c, ty_c, rot_c, fx_c, fy_c = estimate_affine_labels(s_in0, s_out0, max_scale, max_shift)
+        else:
+            sx_c = sy_c = 0; tx_c = ty_c = max_shift; rot_c = fx_c = fy_c = 0
         supports_perm: List[Tuple[np.ndarray, np.ndarray]] = []
         for s_idx in range(support_k):
             if s_idx < len(supports):
@@ -368,26 +518,30 @@ def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max
                 xs = np.concatenate([xs_in, xs_out], axis=0)
                 ys = np.concatenate([ys_in, ys_out], axis=0)
                 cols = np.concatenate([cols_in, cols_out], axis=0)
+                roles = np.concatenate([np.zeros_like(xs_in), np.ones_like(xs_out)], axis=0)
             else:
                 # empty support (pad)
                 xs = np.zeros((0,), dtype=np.int64)
                 ys = np.zeros((0,), dtype=np.int64)
                 cols = np.zeros((0,), dtype=np.int64)
+                roles = np.zeros((0,), dtype=np.int64)
 
             # pad/truncate tokens to max_tokens_per_support
             xs_p = pad_token_list(xs, max_tokens_per_support, pad_value=0)
             ys_p = pad_token_list(ys, max_tokens_per_support, pad_value=0)
             cols_p = pad_token_list(cols, max_tokens_per_support, pad_value=0)
+            roles_p = pad_token_list(roles, max_tokens_per_support, pad_value=0)
             mask = np.zeros((max_tokens_per_support,), dtype=bool)
             mask[:min(xs.shape[0], max_tokens_per_support)] = True
 
             # append into per-support buckets
             if len(support_xs) <= s_idx:
-                support_xs.append([]); support_ys.append([]); support_cols.append([]); support_masks.append([])
-            support_xs[s_idx].append(xs_p)
+                support_xs.append([]); support_ys.append([]); support_cols.append([]); support_masks.append([]); support_roles.append([])
+            support_xs[s_idx].append(xs_p)  
             support_ys[s_idx].append(ys_p)
             support_cols[s_idx].append(cols_p)
             support_masks[s_idx].append(mask)
+            support_roles[s_idx].append(roles_p)
 
         # query tokens (we use the output shape if available; else fallback to input shape)
         if q_out is not None:
@@ -412,6 +566,7 @@ def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max
             query_targets.append(np.array(tgt_flat, dtype=np.int64))
             q_in_perm = perm[q_in]
             q_out_perm = tgt
+            true_h = h_t; true_w = w_t
         else:
             # unknown target; create query from input size (best-effort)
             q_in_p = perm[q_in]
@@ -426,6 +581,7 @@ def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max
             query_targets.append(np.array(tgt_flat, dtype=np.int64))
             q_in_perm = q_in_p
             q_out_perm = None
+            true_h = h_t; true_w = w_t
 
         episode_details.append({
             'supports': supports_perm,
@@ -435,6 +591,11 @@ def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max
             'query_hw': (h_t, w_t),
         })
 
+        # stash affine labels and shapes per-episode
+        if 'affine_labels' not in episode_details[-1]:
+            episode_details[-1]['affine_labels'] = (sx_c, sy_c, tx_c, ty_c, rot_c, fx_c, fy_c)
+        episode_details[-1]['true_hw'] = (true_h, true_w)
+
     # Now convert lists into tensors
     # support_* are lists of length S each containing B arrays of shape [T]
     S = len(support_xs)
@@ -443,15 +604,18 @@ def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max
     support_ys_t = []
     support_cols_t = []
     support_masks_t = []
+    support_roles_t = []
     for s_idx in range(S):
         arr_x = np.stack(support_xs[s_idx], axis=0)  # [B, T]
         arr_y = np.stack(support_ys[s_idx], axis=0)
         arr_c = np.stack(support_cols[s_idx], axis=0)
         arr_m = np.stack(support_masks[s_idx], axis=0)
+        arr_r = np.stack(support_roles[s_idx], axis=0)
         support_xs_t.append(torch.tensor(arr_x, dtype=torch.long, device=device))
         support_ys_t.append(torch.tensor(arr_y, dtype=torch.long, device=device))
         support_cols_t.append(torch.tensor(arr_c, dtype=torch.long, device=device))
         support_masks_t.append(torch.tensor(arr_m, dtype=torch.bool, device=device))
+        support_roles_t.append(torch.tensor(arr_r, dtype=torch.long, device=device))
 
     # queries: variable lengths Q_b -> pad to max_Q
     Q_lens = [len(q) for q in query_qx]
@@ -472,7 +636,29 @@ def build_episode_batch(ds: ARCChallengeDataset, batch: int, support_k: int, max
     qmask_t = torch.tensor(qmask, dtype=torch.bool, device=device)
     tgt_t = torch.tensor(tgt_p, dtype=torch.long, device=device)
 
-    return support_xs_t, support_ys_t, support_cols_t, support_masks_t, qx_t, qy_t, qmask_t, tgt_t, episode_details
+    # true output shape (from target if available, else query input shape)
+    true_h_list = [det['true_hw'][0] for det in episode_details]
+    true_w_list = [det['true_hw'][1] for det in episode_details]
+    true_h_t = torch.tensor(np.array(true_h_list, dtype=np.int64), dtype=torch.long, device=device)
+    true_w_t = torch.tensor(np.array(true_w_list, dtype=np.int64), dtype=torch.long, device=device)
+
+    # query input H,W
+    qh_list = [det['query_hw'][0] for det in episode_details]
+    qw_list = [det['query_hw'][1] for det in episode_details]
+    qh_t = torch.tensor(np.array(qh_list, dtype=np.int64), dtype=torch.long, device=device)
+    qw_t = torch.tensor(np.array(qw_list, dtype=np.int64), dtype=torch.long, device=device)
+
+    # affine labels tensors (estimated from first support)
+    labs = [det['affine_labels'] for det in episode_details]
+    sx_lab_t = torch.tensor(np.array([l[0] for l in labs], dtype=np.int64), dtype=torch.long, device=device)
+    sy_lab_t = torch.tensor(np.array([l[1] for l in labs], dtype=np.int64), dtype=torch.long, device=device)
+    tx_lab_t = torch.tensor(np.array([l[2] for l in labs], dtype=np.int64), dtype=torch.long, device=device)
+    ty_lab_t = torch.tensor(np.array([l[3] for l in labs], dtype=np.int64), dtype=torch.long, device=device)
+    rot_lab_t = torch.tensor(np.array([l[4] for l in labs], dtype=np.int64), dtype=torch.long, device=device)
+    fx_lab_t = torch.tensor(np.array([l[5] for l in labs], dtype=np.int64), dtype=torch.long, device=device)
+    fy_lab_t = torch.tensor(np.array([l[6] for l in labs], dtype=np.int64), dtype=torch.long, device=device)
+
+    return support_xs_t, support_ys_t, support_cols_t, support_roles_t, support_masks_t, qx_t, qy_t, qmask_t, tgt_t, true_h_t, true_w_t, qh_t, qw_t, sx_lab_t, sy_lab_t, tx_lab_t, ty_lab_t, rot_lab_t, fx_lab_t, fy_lab_t, episode_details
 
 
 # Visualization utilities
@@ -574,6 +760,69 @@ def save_episode_visual(supports: List[Tuple[np.ndarray, np.ndarray]], q_in: np.
     canvas.save(out_path)
 
 
+def compute_losses(
+    pixel_logits: torch.Tensor,
+    h_logits: torch.Tensor,
+    w_logits: torch.Tensor,
+    affine_logits: Dict[str, torch.Tensor],
+    qx: torch.Tensor, qy: torch.Tensor, qmask: torch.Tensor,
+    targets: torch.Tensor,
+    true_h: torch.Tensor, true_w: torch.Tensor,
+    max_x: int, max_y: int,
+    affine_labels: Tuple[torch.Tensor, ...],
+    lambda_shape: float = 1.0,
+    lambda_predmask: float = 0.0,
+    lambda_affine: float = 1.0,
+):
+    B, Qmax, C = pixel_logits.shape
+
+    # shape losses
+    h_labels = true_h.clamp(min=1, max=max_y) - 1
+    w_labels = true_w.clamp(min=1, max=max_x) - 1
+    loss_h = F.cross_entropy(h_logits, h_labels)
+    loss_w = F.cross_entropy(w_logits, w_labels)
+    shape_loss = loss_h + loss_w
+
+    # pixel loss on ground-truth valid region
+    logits_flat = pixel_logits.view(-1, C)
+    t_flat = targets.view(-1)
+    m_flat = qmask.view(-1)
+    pixel_loss_true = F.cross_entropy(logits_flat[m_flat], t_flat[m_flat])
+
+    # optional pixel loss over predicted region from shape head
+    pixel_loss_pred = torch.tensor(0.0, device=pixel_logits.device)
+    if lambda_predmask > 0:
+        pred_h = torch.argmax(h_logits, dim=-1) + 1
+        pred_w = torch.argmax(w_logits, dim=-1) + 1
+        pw = pred_w.unsqueeze(1)
+        ph = pred_h.unsqueeze(1)
+        pred_region = (qx < pw) & (qy < ph) & qmask
+        m2 = pred_region.view(-1)
+        if m2.any():
+            pixel_loss_pred = F.cross_entropy(logits_flat[m2], t_flat[m2])
+
+    # affine classification losses
+    (sx_lab, sy_lab, tx_lab, ty_lab, rot_lab, fx_lab, fy_lab) = affine_labels
+    loss_sx = F.cross_entropy(affine_logits['sx'], sx_lab)
+    loss_sy = F.cross_entropy(affine_logits['sy'], sy_lab)
+    loss_tx = F.cross_entropy(affine_logits['tx'], tx_lab)
+    loss_ty = F.cross_entropy(affine_logits['ty'], ty_lab)
+    loss_rot = F.cross_entropy(affine_logits['rot'], rot_lab)
+    loss_fx = F.cross_entropy(affine_logits['fx'], fx_lab)
+    loss_fy = F.cross_entropy(affine_logits['fy'], fy_lab)
+    affine_loss = loss_sx + loss_sy + loss_tx + loss_ty + loss_rot + loss_fx + loss_fy
+
+    total = pixel_loss_true + lambda_shape * shape_loss + lambda_predmask * pixel_loss_pred + lambda_affine * affine_loss
+    parts = {
+        'pixel_true': float(pixel_loss_true.detach().cpu().item()),
+        'pixel_pred': float(pixel_loss_pred.detach().cpu().item()) if lambda_predmask>0 else 0.0,
+        'shape_h': float(loss_h.detach().cpu().item()),
+        'shape_w': float(loss_w.detach().cpu().item()),
+        'affine': float(affine_loss.detach().cpu().item()),
+    }
+    return total, parts
+
+
 def train(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Device:', device)
@@ -601,7 +850,8 @@ def train(args):
     model = CoordFewShotModel(max_x=args.max_x, max_y=args.max_y, num_colors=args.num_colors,
                               embed_dim=args.embed_dim, enc_layers=args.enc_layers,
                               dec_layers=args.dec_layers, nheads=args.nheads,
-                              max_support=args.max_support, max_tokens_per_support=args.max_tokens_per_support).to(device)
+                              max_support=args.max_support, max_tokens_per_support=args.max_tokens_per_support,
+                              max_scale=args.max_scale, max_shift=args.max_shift).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -615,20 +865,35 @@ def train(args):
 
         with tqdm(range(args.iters_per_epoch), desc=f"Epoch {epoch+1}/{args.epochs}", unit="iter") as pbar:
             for it in pbar:
-                sup_xs_t, sup_ys_t, sup_cols_t, sup_masks_t, qx_t, qy_t, qmask_t, tgt_t, _ = \
-                    build_episode_batch(ds, args.batch, args.support_k, args.max_x, args.max_y, args.num_colors, args.max_tokens_per_support, device)
+                (sup_xs_t, sup_ys_t, sup_cols_t, sup_roles_t, sup_masks_t,
+                 qx_t, qy_t, qmask_t, tgt_t, true_h_t, true_w_t, qh_t, qw_t,
+                 sx_lab_t, sy_lab_t, tx_lab_t, ty_lab_t, rot_lab_t, fx_lab_t, fy_lab_t, _details) = \
+                    build_episode_batch(ds, args.batch, args.support_k, args.max_x, args.max_y, args.num_colors, args.max_tokens_per_support, device, args.max_scale, args.max_shift)
 
-                logits = model(list(zip(sup_xs_t, sup_ys_t, sup_cols_t)), sup_masks_t, (qx_t, qy_t))  # [B, Qmax, C]
-                B, Qmax, C = logits.shape
-                # mask out padding positions in loss
-                logits_flat = logits.view(-1, C)
-                tgt_flat = tgt_t.view(-1)
-                mask_flat = qmask_t.view(-1)
-                loss = F.cross_entropy(logits_flat[mask_flat], tgt_flat[mask_flat])
+                pixel_logits, h_logits, w_logits, affine_logits = model(
+                    list(zip(sup_xs_t, sup_ys_t, sup_cols_t, sup_roles_t)),
+                    sup_masks_t,
+                    (qx_t, qy_t),
+                    qmask_t,
+                    (qh_t, qw_t)
+                )
+
+                loss, parts = compute_losses(
+                    pixel_logits, h_logits, w_logits, affine_logits,
+                    qx_t, qy_t, qmask_t,
+                    tgt_t, true_h_t, true_w_t,
+                    args.max_x, args.max_y,
+                    (sx_lab_t, sy_lab_t, tx_lab_t, ty_lab_t, rot_lab_t, fx_lab_t, fy_lab_t),
+                    lambda_shape=args.lambda_shape,
+                    lambda_predmask=args.lambda_predmask,
+                    lambda_affine=args.lambda_affine,
+                )
 
                 # accuracy on non-padding tokens
                 with torch.no_grad():
-                    preds = logits.argmax(dim=-1).view(-1)
+                    preds = pixel_logits.argmax(dim=-1).view(-1)
+                    mask_flat = qmask_t.view(-1)
+                    tgt_flat = tgt_t.view(-1)
                     correct = (preds[mask_flat] == tgt_flat[mask_flat]).sum().item()
                     count = int(mask_flat.sum().item())
                     total_correct_cells += int(correct)
@@ -737,10 +1002,12 @@ def eval_model(model: nn.Module, ds: ARCChallengeDataset, args, device):
     with torch.no_grad():
         with tqdm(range(n), desc="Eval", unit="ep") as pbar:
             for _ in pbar:
-                sup_xs_t, sup_ys_t, sup_cols_t, sup_masks_t, qx_t, qy_t, qmask_t, tgt_t, details = \
-                    build_episode_batch(ds, 1, args.support_k, args.max_x, args.max_y, args.num_colors, args.max_tokens_per_support, device)
-                logits = model(list(zip(sup_xs_t, sup_ys_t, sup_cols_t)), sup_masks_t, (qx_t, qy_t))
-                preds = logits.argmax(dim=-1).cpu().numpy()[0]  # [Qmax]
+                (sup_xs_t, sup_ys_t, sup_cols_t, sup_roles_t, sup_masks_t,
+                 qx_t, qy_t, qmask_t, tgt_t, true_h_t, true_w_t, qh_t, qw_t,
+                 sx_lab_t, sy_lab_t, tx_lab_t, ty_lab_t, rot_lab_t, fx_lab_t, fy_lab_t, details) = \
+                    build_episode_batch(ds, 1, args.support_k, args.max_x, args.max_y, args.num_colors, args.max_tokens_per_support, device, args.max_scale, args.max_shift)
+                pixel_logits, h_logits, w_logits, affine_logits = model(list(zip(sup_xs_t, sup_ys_t, sup_cols_t, sup_roles_t)), sup_masks_t, (qx_t, qy_t), qmask_t, (qh_t, qw_t))
+                preds = pixel_logits.argmax(dim=-1).cpu().numpy()[0]  # [Qmax]
                 mask = qmask_t.cpu().numpy()[0]
                 tgt = tgt_t.cpu().numpy()[0]
                 # compute per-cell
@@ -799,6 +1066,13 @@ def parse_args():
     # Visualization
     p.add_argument('--vis_dir', type=str, default=None, help='Directory to save episode visualizations during eval')
     p.add_argument('--cell_size', type=int, default=16, help='Cell size for visualization images')
+    # Loss weights
+    p.add_argument('--lambda_shape', type=float, default=1.0)
+    p.add_argument('--lambda_predmask', type=float, default=0.25)
+    p.add_argument('--lambda_affine', type=float, default=1.0)
+    # Affine discretization ranges
+    p.add_argument('--max_scale', type=int, default=4)
+    p.add_argument('--max_shift', type=int, default=15)
     # Optuna
     p.add_argument('--optuna_trials', type=int, default=0, help='Number of Optuna trials to run; 0 disables tuning')
     p.add_argument('--optuna_checkpoint_dir', type=str, default='optuna_checkpoints', help='Directory to store per-trial checkpoints')
