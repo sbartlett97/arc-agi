@@ -37,7 +37,7 @@ class ARCAGISolver:
         
         # Initialize components
         self.data_loader = ARCDataLoader(data_dir)
-        self.expert_manager = ExpertManager(experts_dir=experts_dir)
+        self.expert_manager = ExpertManager(experts_dir=experts_dir, device=self.device)
         
         # Statistics
         self.stats = {
@@ -205,6 +205,18 @@ class ARCAGISolver:
             summary['experts'].append(expert_info)
         
         return summary
+    
+    def check_device_placement(self):
+        """Check if all models are on the correct device"""
+        print(f"Checking device placement for {len(self.expert_manager.experts)} experts...")
+        for i, expert in enumerate(self.expert_manager.experts):
+            model_device = next(expert.model.parameters()).device
+            print(f"Expert {i}: {expert.id} -> Device: {model_device}")
+            if model_device != self.device:
+                print(f"  WARNING: Expert {expert.id} is on {model_device}, expected {self.device}")
+                # Move to correct device
+                expert.model.to(self.device)
+                print(f"  Moved to {self.device}")
 
 
 def main():
@@ -223,6 +235,16 @@ def main():
                        help="Save experts every N tasks during training")
     
     args = parser.parse_args()
+    
+    # Show device information
+    print("=== Device Information ===")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA device count: {torch.cuda.device_count()}")
+        print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    print(f"Selected device: {args.device}")
+    print()
     
     # Initialize solver
     solver = ARCAGISolver(
@@ -247,6 +269,9 @@ def main():
             # Save final experts
             solver.save_experts()
             
+            # Check device placement
+            solver.check_device_placement()
+            
             # Save training statistics
             with open("training_stats.json", "w") as f:
                 json.dump(stats, f, indent=2)
@@ -258,11 +283,14 @@ def main():
     elif args.mode == "evaluate":
         # Load test/evaluation data
         try:
-            test_dataset = solver.data_loader.load_test_data()
+            test_dataset = solver.data_loader.load_evaluation_data()
             print(f"Test dataset loaded: {len(test_dataset)} tasks")
             
             # Evaluate
             eval_stats = solver.evaluate_on_dataset(test_dataset, max_tasks=args.max_tasks)
+            
+            # Check device placement
+            solver.check_device_placement()
             
             # Save evaluation statistics
             with open("evaluation_stats.json", "w") as f:
@@ -347,6 +375,9 @@ def main():
         # Solve task
         print("\nSolving task...")
         solution, expert = solver.solve_single_task(padded_test, support_samples)
+        
+        # Check device placement
+        solver.check_device_placement()
         
         print(f"\nSolution found using expert: {expert.id}")
         print("Solution grid:")

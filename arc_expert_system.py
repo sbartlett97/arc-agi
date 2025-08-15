@@ -33,11 +33,20 @@ class ExpertManager:
                  experts_dir: str = "experts",
                  embed_dim: int = 256,
                  similarity_threshold: float = 0.8,
-                 max_experts: int = 100):
+                 max_experts: int = 100,
+                 device: str = "auto"):
         self.experts_dir = experts_dir
         self.embed_dim = embed_dim
         self.similarity_threshold = similarity_threshold
         self.max_experts = max_experts
+        
+        # Set device
+        if device == "auto":
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+        
+        print(f"Expert manager using device: {self.device}")
         
         # Create experts directory
         os.makedirs(experts_dir, exist_ok=True)
@@ -93,7 +102,8 @@ class ExpertManager:
             return None
         
         model = create_arc_model()
-        model.load_state_dict(torch.load(model_path, map_location='cpu'))
+        model.load_state_dict(torch.load(model_path, map_location=self.device))
+        model.to(self.device)
         model.eval()
         
         # Load metadata
@@ -127,8 +137,9 @@ class ExpertManager:
         expert_dir = os.path.join(self.experts_dir, expert.id)
         os.makedirs(expert_dir, exist_ok=True)
         
-        # Save model
-        torch.save(expert.model.state_dict(), os.path.join(expert_dir, "model.pth"))
+        # Save model (move to CPU for saving)
+        model_state = {k: v.cpu() for k, v in expert.model.state_dict().items()}
+        torch.save(model_state, os.path.join(expert_dir, "model.pth"))
         
         # Save metadata
         metadata = {
@@ -153,8 +164,8 @@ class ExpertManager:
         
         with torch.no_grad():
             for sample in support_samples:
-                input_grid = torch.tensor(sample['input'], dtype=torch.long).unsqueeze(0)
-                output_grid = torch.tensor(sample['output'], dtype=torch.long).unsqueeze(0)
+                input_grid = torch.tensor(sample['input'], dtype=torch.long, device=self.device).unsqueeze(0)
+                output_grid = torch.tensor(sample['output'], dtype=torch.long, device=self.device).unsqueeze(0)
                 
                 # Get embeddings
                 input_emb = model.get_embeddings(input_grid)  # (1, num_patches, embed_dim)
@@ -165,7 +176,7 @@ class ExpertManager:
                 
                 # Average across patches
                 delta_avg = torch.mean(delta, dim=1).squeeze(0)  # (embed_dim,)
-                deltas.append(delta_avg.numpy())
+                deltas.append(delta_avg.cpu().numpy())
         
         return deltas
     
@@ -202,8 +213,8 @@ class ExpertManager:
         
         with torch.no_grad():
             for sample in support_samples:
-                input_grid = torch.tensor(sample['input'], dtype=torch.long).unsqueeze(0)
-                expected_output = torch.tensor(sample['output'], dtype=torch.long)
+                input_grid = torch.tensor(sample['input'], dtype=torch.long, device=self.device).unsqueeze(0)
+                expected_output = torch.tensor(sample['output'], dtype=torch.long, device=self.device)
                 
                 # Get prediction
                 predicted_output = expert.model(input_grid)
@@ -228,6 +239,7 @@ class ExpertManager:
         """Train a new expert on support samples"""
         # Create new model
         model = create_arc_model()
+        model.to(self.device)
         model.train()
         
         # Setup optimizer and loss
@@ -238,8 +250,8 @@ class ExpertManager:
         inputs = []
         targets = []
         for sample in support_samples:
-            inputs.append(torch.tensor(sample['input'], dtype=torch.long))
-            targets.append(torch.tensor(sample['output'], dtype=torch.long))
+            inputs.append(torch.tensor(sample['input'], dtype=torch.long, device=self.device))
+            targets.append(torch.tensor(sample['output'], dtype=torch.long, device=self.device))
         
         # Training loop
         for epoch in range(num_epochs):
@@ -352,6 +364,7 @@ class ExpertManager:
         """Solve an ARC task using the expert system"""
         # Create a temporary model to calculate delta embeddings
         temp_model = create_arc_model()
+        temp_model.to(self.device)
         temp_model.eval()
         
         # Calculate delta embeddings
@@ -369,9 +382,9 @@ class ExpertManager:
             if is_valid:
                 # Use existing expert
                 with torch.no_grad():
-                    test_tensor = torch.tensor(test_sample, dtype=torch.long).unsqueeze(0)
+                    test_tensor = torch.tensor(test_sample, dtype=torch.long, device=self.device).unsqueeze(0)
                     solution = expert.model(test_tensor)
-                    return solution.squeeze(0).numpy(), expert
+                    return solution.squeeze(0).cpu().numpy(), expert
         
         # No suitable expert found, train new one
         print(f"Training new expert for task {task_id}")
@@ -379,14 +392,14 @@ class ExpertManager:
         
         # Use new expert
         with torch.no_grad():
-            test_tensor = torch.tensor(test_sample, dtype=torch.long).unsqueeze(0)
+            test_tensor = torch.tensor(test_sample, dtype=torch.long, device=self.device).unsqueeze(0)
             solution = new_expert.model(test_tensor)
-            return solution.squeeze(0).numpy(), new_expert
+            return solution.squeeze(0).cpu().numpy(), new_expert
 
 
-def create_expert_manager(experts_dir: str = "experts") -> ExpertManager:
+def create_expert_manager(experts_dir: str = "experts", device: str = "auto") -> ExpertManager:
     """Create an expert manager with default settings"""
-    return ExpertManager(experts_dir=experts_dir)
+    return ExpertManager(experts_dir=experts_dir, device=device)
 
 
 if __name__ == "__main__":
