@@ -1,6 +1,9 @@
-numpy>=1.24
-pytest>=7
-torch
-tqdm
-Pillow>=10
-optuna>=3.6
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+numpy>=1.21.0
+scikit-learn>=1.0.0
+faiss-cpu>=1.7.0
+Pillow>=8.0.0
+tqdm>=4.60.0
+matplotlib>=3.5.0
