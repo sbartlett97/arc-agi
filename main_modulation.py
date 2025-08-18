@@ -99,8 +99,8 @@ class ARCModulationSolver:
                 all_support_samples=all_support_samples,
                 test_inputs=test_inputs,
                 test_targets=test_targets,
-                support_epochs=1,  # Single epoch on support samples
-                test_epochs=10,    # Multiple epochs on test data
+                support_epochs=5,  # Single epoch on support samples
+                test_epochs=100,    # Multiple epochs on test data
                 batch_size=batch_size,
                 gradient_accumulation_steps=gradient_accumulation,
                 max_support_samples_per_batch=max_support_per_batch
