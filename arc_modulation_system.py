@@ -352,14 +352,14 @@ class ModulationSystem:
                 padded_targets = []
                 for inp, tgt in zip(batch_inputs, batch_targets):
                     # Pad input to 30x30
-                    padded_inp = torch.zeros((30, 30), dtype=np.int64, device=self.device)
+                    padded_inp = torch.zeros((30, 30), dtype=torch.long, device=self.device)
                     padded_inp[:inp.shape[0], :inp.shape[1]] = inp
-                    padded_inputs.append(torch.tensor(padded_inp, dtype=torch.long, device=self.device))
+                    padded_inputs.append(padded_inp)
                     
                     # Pad target to 30x30
-                    padded_tgt = torch.zeros((30, 30), dtype=np.int64, device=self.device)
+                    padded_tgt = torch.zeros((30, 30), dtype=torch.long, device=self.device)
                     padded_tgt[:tgt.shape[0], :tgt.shape[1]] = tgt
-                    padded_targets.append(torch.tensor(padded_tgt, dtype=torch.long, device=self.device))
+                    padded_targets.append(padded_tgt)
                 
                 # Stack into batch
                 batch_input = torch.stack(padded_inputs)
