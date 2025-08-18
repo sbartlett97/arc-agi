@@ -257,12 +257,14 @@ class ModulationSystem:
         
         # Phase 1: Train on merged support samples with memory-efficient batching
         support_losses = []
+        from tqdm import tqdm
+
         for epoch in range(support_epochs):
             epoch_loss = 0
             optimizer.zero_grad()
             
             # Process support samples in smaller batches with gradient accumulation
-            for i in range(0, len(all_support_samples), batch_size):
+            for i in tqdm(range(0, len(all_support_samples), batch_size), desc=f"Support Epoch {epoch+1}/{support_epochs}"):
                 batch_samples = all_support_samples[i:i+batch_size]
                 
                 # Use only a subset of support samples for modulation to save memory
@@ -338,7 +340,7 @@ class ModulationSystem:
             optimizer.zero_grad()
             
             # Process test samples in batches with gradient accumulation
-            for i in range(0, len(test_inputs), batch_size):
+            for i in tqdm(range(0, len(test_inputs), batch_size), desc=f"Test Epoch {epoch+1}/{test_epochs}"):
                 batch_inputs = test_inputs[i:i+batch_size]
                 batch_targets = test_targets[i:i+batch_size]
                 
