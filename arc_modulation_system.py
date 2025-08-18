@@ -220,9 +220,11 @@ class ModulationSystem:
                                          learning_rate: float = 1e-4,
                                          support_epochs: int = 1,
                                          test_epochs: int = 10,
-                                         batch_size: int = 4) -> Dict[str, float]:
+                                         batch_size: int = 2,
+                                         gradient_accumulation_steps: int = 4,
+                                         max_support_samples_per_batch: int = 8) -> Dict[str, float]:
         """
-        Two-phase training: first on merged support samples, then on test data
+        Memory-efficient two-phase training: first on merged support samples, then on test data
         
         Args:
             all_support_samples: All support samples from all tasks
@@ -231,7 +233,9 @@ class ModulationSystem:
             learning_rate: Learning rate for training
             support_epochs: Number of epochs on support samples
             test_epochs: Number of epochs on test data
-            batch_size: Batch size for training
+            batch_size: Batch size for training (reduced for memory efficiency)
+            gradient_accumulation_steps: Number of steps to accumulate gradients
+            max_support_samples_per_batch: Maximum support samples to use per batch
             
         Returns:
             Dictionary with training losses
@@ -249,15 +253,20 @@ class ModulationSystem:
         }
         
         print(f"Phase 1: Training on {len(all_support_samples)} merged support samples for {support_epochs} epochs")
+        print(f"Memory-efficient settings: batch_size={batch_size}, grad_accum={gradient_accumulation_steps}, max_support={max_support_samples_per_batch}")
         
-        # Phase 1: Train on merged support samples
+        # Phase 1: Train on merged support samples with memory-efficient batching
         support_losses = []
         for epoch in range(support_epochs):
             epoch_loss = 0
+            optimizer.zero_grad()
             
-            # Process support samples in batches
+            # Process support samples in smaller batches with gradient accumulation
             for i in range(0, len(all_support_samples), batch_size):
                 batch_samples = all_support_samples[i:i+batch_size]
+                
+                # Use only a subset of support samples for modulation to save memory
+                support_subset = all_support_samples[:max_support_samples_per_batch]
                 
                 batch_inputs = []
                 batch_targets = []
@@ -283,24 +292,36 @@ class ModulationSystem:
                 batch_input = torch.stack(padded_inputs)
                 batch_target = torch.stack(padded_targets)
                 
-                optimizer.zero_grad()
-                
-                # Forward pass with modulation using all support samples
-                logits = self.model.vit(batch_input, all_support_samples)
+                # Forward pass with modulation using subset of support samples
+                logits = self.model.vit(batch_input, support_subset)
                 
                 # Reshape for loss calculation
                 actual_batch_size, grid_size, _, num_classes = logits.shape
                 logits = logits.view(actual_batch_size * grid_size * grid_size, num_classes)
                 targets_flat = batch_target.view(-1)
                 
-                # Calculate loss
-                loss = criterion(logits, targets_flat)
+                # Calculate loss and scale for gradient accumulation
+                loss = criterion(logits, targets_flat) / gradient_accumulation_steps
                 
                 # Backward pass
                 loss.backward()
-                optimizer.step()
                 
-                epoch_loss += loss.item()
+                # Gradient accumulation
+                if (i // batch_size + 1) % gradient_accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                
+                epoch_loss += loss.item() * gradient_accumulation_steps
+                
+                # Clear memory
+                del batch_input, batch_target, logits, targets_flat, loss
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            # Final gradient step if needed
+            if len(all_support_samples) % (batch_size * gradient_accumulation_steps) != 0:
+                optimizer.step()
+                optimizer.zero_grad()
             
             support_losses.append(epoch_loss)
             print(f"  Support epoch {epoch + 1}/{support_epochs}: Loss = {epoch_loss:.4f}")
@@ -310,15 +331,19 @@ class ModulationSystem:
         
         print(f"\nPhase 2: Training on {len(test_inputs)} test samples for {test_epochs} epochs")
         
-        # Phase 2: Train on test data with support samples for modulation
+        # Phase 2: Train on test data with memory-efficient approach
         test_losses = []
         for epoch in range(test_epochs):
             epoch_loss = 0
+            optimizer.zero_grad()
             
-            # Process test samples in batches
+            # Process test samples in batches with gradient accumulation
             for i in range(0, len(test_inputs), batch_size):
                 batch_inputs = test_inputs[i:i+batch_size]
                 batch_targets = test_targets[i:i+batch_size]
+                
+                # Use subset of support samples for modulation
+                support_subset = all_support_samples[:max_support_samples_per_batch]
                 
                 # Convert to tensors and pad
                 padded_inputs = []
@@ -338,24 +363,36 @@ class ModulationSystem:
                 batch_input = torch.stack(padded_inputs)
                 batch_target = torch.stack(padded_targets)
                 
-                optimizer.zero_grad()
-                
-                # Forward pass with modulation using support samples for delta-embedding
-                logits = self.model.vit(batch_input, all_support_samples)
+                # Forward pass with modulation using support subset
+                logits = self.model.vit(batch_input, support_subset)
                 
                 # Reshape for loss calculation
                 actual_batch_size, grid_size, _, num_classes = logits.shape
                 logits = logits.view(actual_batch_size * grid_size * grid_size, num_classes)
                 targets_flat = batch_target.view(-1)
                 
-                # Calculate loss
-                loss = criterion(logits, targets_flat)
+                # Calculate loss and scale for gradient accumulation
+                loss = criterion(logits, targets_flat) / gradient_accumulation_steps
                 
                 # Backward pass
                 loss.backward()
-                optimizer.step()
                 
-                epoch_loss += loss.item()
+                # Gradient accumulation
+                if (i // batch_size + 1) % gradient_accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                
+                epoch_loss += loss.item() * gradient_accumulation_steps
+                
+                # Clear memory
+                del batch_input, batch_target, logits, targets_flat, loss
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            # Final gradient step if needed
+            if len(test_inputs) % (batch_size * gradient_accumulation_steps) != 0:
+                optimizer.step()
+                optimizer.zero_grad()
             
             test_losses.append(epoch_loss)
             print(f"  Test epoch {epoch + 1}/{test_epochs}: Loss = {epoch_loss:.4f}")

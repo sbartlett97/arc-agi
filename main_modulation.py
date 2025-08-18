@@ -53,7 +53,10 @@ class ARCModulationSolver:
                         max_tasks: int = None,
                         save_interval: int = 10,
                         train_threshold: float = 0.7,
-                        use_merged_training: bool = True) -> Dict:
+                        use_merged_training: bool = True,
+                        batch_size: int = 2,
+                        gradient_accumulation: int = 4,
+                        max_support_per_batch: int = 8) -> Dict:
         """Train the modulation model on a dataset"""
         print(f"Training on dataset with {len(dataset)} tasks")
         
@@ -97,7 +100,10 @@ class ARCModulationSolver:
                 test_inputs=test_inputs,
                 test_targets=test_targets,
                 support_epochs=1,  # Single epoch on support samples
-                test_epochs=10     # Multiple epochs on test data
+                test_epochs=10,    # Multiple epochs on test data
+                batch_size=batch_size,
+                gradient_accumulation_steps=gradient_accumulation,
+                max_support_samples_per_batch=max_support_per_batch
             )
             
             # Evaluate on all tasks
@@ -298,6 +304,12 @@ def main():
                        help="Use merged training approach (Phase 1: support samples, Phase 2: test data)")
     parser.add_argument("--no_merged_training", action="store_true", default=False,
                        help="Use individual task training approach")
+    parser.add_argument("--batch_size", type=int, default=2,
+                       help="Batch size for training (smaller = more memory efficient)")
+    parser.add_argument("--gradient_accumulation", type=int, default=4,
+                       help="Number of gradient accumulation steps")
+    parser.add_argument("--max_support_per_batch", type=int, default=8,
+                       help="Maximum support samples to use per batch")
     
     args = parser.parse_args()
     
@@ -330,7 +342,10 @@ def main():
                 train_dataset, 
                 max_tasks=args.max_tasks,
                 save_interval=args.save_interval,
-                use_merged_training=use_merged
+                use_merged_training=use_merged,
+                batch_size=args.batch_size,
+                gradient_accumulation=args.gradient_accumulation,
+                max_support_per_batch=args.max_support_per_batch
             )
             
             # Save final model
