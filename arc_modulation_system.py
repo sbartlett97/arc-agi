@@ -213,6 +213,165 @@ class ModulationSystem:
         
         return avg_loss
     
+    def train_with_merged_support_samples(self, 
+                                         all_support_samples: List[Dict],
+                                         test_inputs: List[np.ndarray],
+                                         test_targets: List[np.ndarray],
+                                         learning_rate: float = 1e-4,
+                                         support_epochs: int = 1,
+                                         test_epochs: int = 10,
+                                         batch_size: int = 4) -> Dict[str, float]:
+        """
+        Two-phase training: first on merged support samples, then on test data
+        
+        Args:
+            all_support_samples: All support samples from all tasks
+            test_inputs: List of test input grids
+            test_targets: List of expected test outputs
+            learning_rate: Learning rate for training
+            support_epochs: Number of epochs on support samples
+            test_epochs: Number of epochs on test data
+            batch_size: Batch size for training
+            
+        Returns:
+            Dictionary with training losses
+        """
+        self.model.train()
+        
+        # Setup optimizer and loss
+        optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate)
+        criterion = nn.CrossEntropyLoss()
+        
+        training_stats = {
+            'support_loss': 0.0,
+            'test_loss': 0.0,
+            'total_loss': 0.0
+        }
+        
+        print(f"Phase 1: Training on {len(all_support_samples)} merged support samples for {support_epochs} epochs")
+        
+        # Phase 1: Train on merged support samples
+        support_losses = []
+        for epoch in range(support_epochs):
+            epoch_loss = 0
+            
+            # Process support samples in batches
+            for i in range(0, len(all_support_samples), batch_size):
+                batch_samples = all_support_samples[i:i+batch_size]
+                
+                batch_inputs = []
+                batch_targets = []
+                for sample in batch_samples:
+                    batch_inputs.append(torch.tensor(sample['input'], dtype=torch.long, device=self.device))
+                    batch_targets.append(torch.tensor(sample['output'], dtype=torch.long, device=self.device))
+                
+                # Pad batch to full grid size (30x30)
+                padded_inputs = []
+                padded_targets = []
+                for inp, tgt in zip(batch_inputs, batch_targets):
+                    # Pad input to 30x30
+                    padded_inp = torch.zeros(30, 30, dtype=inp.dtype, device=self.device)
+                    padded_inp[:inp.shape[0], :inp.shape[1]] = inp
+                    padded_inputs.append(padded_inp)
+                    
+                    # Pad target to 30x30
+                    padded_tgt = torch.zeros(30, 30, dtype=tgt.dtype, device=self.device)
+                    padded_tgt[:tgt.shape[0], :tgt.shape[1]] = tgt
+                    padded_targets.append(padded_tgt)
+                
+                # Stack into batch
+                batch_input = torch.stack(padded_inputs)
+                batch_target = torch.stack(padded_targets)
+                
+                optimizer.zero_grad()
+                
+                # Forward pass with modulation using all support samples
+                logits = self.model.vit(batch_input, all_support_samples)
+                
+                # Reshape for loss calculation
+                actual_batch_size, grid_size, _, num_classes = logits.shape
+                logits = logits.view(actual_batch_size * grid_size * grid_size, num_classes)
+                targets_flat = batch_target.view(-1)
+                
+                # Calculate loss
+                loss = criterion(logits, targets_flat)
+                
+                # Backward pass
+                loss.backward()
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+            
+            support_losses.append(epoch_loss)
+            print(f"  Support epoch {epoch + 1}/{support_epochs}: Loss = {epoch_loss:.4f}")
+        
+        training_stats['support_loss'] = np.mean(support_losses)
+        print(f"Phase 1 completed. Average support loss: {training_stats['support_loss']:.4f}")
+        
+        print(f"\nPhase 2: Training on {len(test_inputs)} test samples for {test_epochs} epochs")
+        
+        # Phase 2: Train on test data with support samples for modulation
+        test_losses = []
+        for epoch in range(test_epochs):
+            epoch_loss = 0
+            
+            # Process test samples in batches
+            for i in range(0, len(test_inputs), batch_size):
+                batch_inputs = test_inputs[i:i+batch_size]
+                batch_targets = test_targets[i:i+batch_size]
+                
+                # Convert to tensors and pad
+                padded_inputs = []
+                padded_targets = []
+                for inp, tgt in zip(batch_inputs, batch_targets):
+                    # Pad input to 30x30
+                    padded_inp = torch.zeros(30, 30, dtype=np.int64)
+                    padded_inp[:inp.shape[0], :inp.shape[1]] = inp
+                    padded_inputs.append(torch.tensor(padded_inp, dtype=torch.long, device=self.device))
+                    
+                    # Pad target to 30x30
+                    padded_tgt = torch.zeros(30, 30, dtype=np.int64)
+                    padded_tgt[:tgt.shape[0], :tgt.shape[1]] = tgt
+                    padded_targets.append(torch.tensor(padded_tgt, dtype=torch.long, device=self.device))
+                
+                # Stack into batch
+                batch_input = torch.stack(padded_inputs)
+                batch_target = torch.stack(padded_targets)
+                
+                optimizer.zero_grad()
+                
+                # Forward pass with modulation using support samples for delta-embedding
+                logits = self.model.vit(batch_input, all_support_samples)
+                
+                # Reshape for loss calculation
+                actual_batch_size, grid_size, _, num_classes = logits.shape
+                logits = logits.view(actual_batch_size * grid_size * grid_size, num_classes)
+                targets_flat = batch_target.view(-1)
+                
+                # Calculate loss
+                loss = criterion(logits, targets_flat)
+                
+                # Backward pass
+                loss.backward()
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+            
+            test_losses.append(epoch_loss)
+            print(f"  Test epoch {epoch + 1}/{test_epochs}: Loss = {epoch_loss:.4f}")
+            
+            # Early stopping if loss is very low
+            if epoch_loss < 0.01:
+                break
+        
+        training_stats['test_loss'] = np.mean(test_losses)
+        training_stats['total_loss'] = training_stats['support_loss'] + training_stats['test_loss']
+        
+        print(f"Phase 2 completed. Average test loss: {training_stats['test_loss']:.4f}")
+        print(f"Total training completed. Combined loss: {training_stats['total_loss']:.4f}")
+        
+        return training_stats
+    
     def validate_on_support_samples(self, 
                                    support_samples: List[Dict],
                                    threshold: float = 0.7) -> Tuple[bool, float]:

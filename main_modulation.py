@@ -52,7 +52,8 @@ class ARCModulationSolver:
                         dataset: ARCDataset,
                         max_tasks: int = None,
                         save_interval: int = 10,
-                        train_threshold: float = 0.7) -> Dict:
+                        train_threshold: float = 0.7,
+                        use_merged_training: bool = True) -> Dict:
         """Train the modulation model on a dataset"""
         print(f"Training on dataset with {len(dataset)} tasks")
         
@@ -65,40 +66,101 @@ class ARCModulationSolver:
         training_start_time = time.time()
         accuracies = []
         
-        for i in tqdm(range(dataset_size), desc="Training modulation model"):
-            try:
-                # Get task
-                test_sample, support_samples, test_solution = dataset[i]
-                
-                # Solve task with training if needed
-                solution, accuracy = self.modulation_system.solve_and_train(
-                    test_sample, support_samples, f"task_{i}", train_if_needed=True
-                )
-                
-                accuracies.append(accuracy)
-                
-                # Update statistics
-                if accuracy >= train_threshold:
-                    self.stats['tasks_solved_without_training'] += 1
-                else:
-                    self.stats['tasks_requiring_training'] += 1
-                
-                # Save model periodically
-                if (i + 1) % save_interval == 0:
-                    self.modulation_system.save_model()
+        if use_merged_training:
+            print("Using merged training approach: Phase 1 (support samples) + Phase 2 (test data)")
+            
+            # Phase 1: Collect all support samples and train on them
+            print("\nPhase 1: Collecting and training on all support samples...")
+            all_support_samples = []
+            test_inputs = []
+            test_targets = []
+            
+            for i in range(dataset_size):
+                try:
+                    test_sample, support_samples, test_solution = dataset[i]
                     
-                    # Get current performance stats
-                    perf_stats = self.modulation_system.get_performance_stats()
-                    current_avg = np.mean(accuracies[-save_interval:])
+                    # Add support samples to the collection
+                    all_support_samples.extend(support_samples)
                     
-                    print(f"Processed {i + 1}/{dataset_size} tasks")
-                    print(f"  Recent accuracy: {current_avg:.3f}")
-                    print(f"  Overall accuracy: {perf_stats['average_accuracy']:.3f}")
-                    print(f"  Tasks above threshold: {perf_stats['tasks_above_threshold']}/{perf_stats['total_tasks']}")
-                
-            except Exception as e:
-                print(f"Error processing task {i}: {e}")
-                accuracies.append(0.0)
+                    # Store test data for phase 2
+                    test_inputs.append(test_sample)
+                    test_targets.append(test_solution)
+                    
+                except Exception as e:
+                    print(f"Error collecting data from task {i}: {e}")
+            
+            print(f"Collected {len(all_support_samples)} support samples from {dataset_size} tasks")
+            
+            # Train on merged support samples first
+            support_training_stats = self.modulation_system.train_with_merged_support_samples(
+                all_support_samples=all_support_samples,
+                test_inputs=test_inputs,
+                test_targets=test_targets,
+                support_epochs=1,  # Single epoch on support samples
+                test_epochs=10     # Multiple epochs on test data
+            )
+            
+            # Evaluate on all tasks
+            print("\nEvaluating on all tasks after merged training...")
+            for i in tqdm(range(dataset_size), desc="Evaluating after training"):
+                try:
+                    test_sample, support_samples, test_solution = dataset[i]
+                    
+                    # Solve task (no additional training needed)
+                    solution, accuracy = self.modulation_system.solve_and_train(
+                        test_sample, support_samples, f"task_{i}", train_if_needed=False
+                    )
+                    
+                    accuracies.append(accuracy)
+                    
+                    # Update statistics
+                    if accuracy >= train_threshold:
+                        self.stats['tasks_solved_without_training'] += 1
+                    else:
+                        self.stats['tasks_requiring_training'] += 1
+                    
+                except Exception as e:
+                    print(f"Error evaluating task {i}: {e}")
+                    accuracies.append(0.0)
+            
+        else:
+            # Original approach: train on each task individually
+            print("Using individual task training approach")
+            
+            for i in tqdm(range(dataset_size), desc="Training modulation model"):
+                try:
+                    # Get task
+                    test_sample, support_samples, test_solution = dataset[i]
+                    
+                    # Solve task with training if needed
+                    solution, accuracy = self.modulation_system.solve_and_train(
+                        test_sample, support_samples, f"task_{i}", train_if_needed=True
+                    )
+                    
+                    accuracies.append(accuracy)
+                    
+                    # Update statistics
+                    if accuracy >= train_threshold:
+                        self.stats['tasks_solved_without_training'] += 1
+                    else:
+                        self.stats['tasks_requiring_training'] += 1
+                    
+                    # Save model periodically
+                    if (i + 1) % save_interval == 0:
+                        self.modulation_system.save_model()
+                        
+                        # Get current performance stats
+                        perf_stats = self.modulation_system.get_performance_stats()
+                        current_avg = np.mean(accuracies[-save_interval:])
+                        
+                        print(f"Processed {i + 1}/{dataset_size} tasks")
+                        print(f"  Recent accuracy: {current_avg:.3f}")
+                        print(f"  Overall accuracy: {perf_stats['average_accuracy']:.3f}")
+                        print(f"  Tasks above threshold: {perf_stats['tasks_above_threshold']}/{perf_stats['total_tasks']}")
+                    
+                except Exception as e:
+                    print(f"Error processing task {i}: {e}")
+                    accuracies.append(0.0)
         
         # Final statistics
         self.stats['total_tasks'] = dataset_size
@@ -232,6 +294,10 @@ def main():
                        help="Save model every N tasks during training")
     parser.add_argument("--train_threshold", type=float, default=0.7,
                        help="Accuracy threshold for determining if training is needed")
+    parser.add_argument("--use_merged_training", action="store_true", default=True,
+                       help="Use merged training approach (Phase 1: support samples, Phase 2: test data)")
+    parser.add_argument("--no_merged_training", action="store_true", default=False,
+                       help="Use individual task training approach")
     
     args = parser.parse_args()
     
@@ -259,10 +325,12 @@ def main():
             print(f"Training dataset loaded: {len(train_dataset)} tasks")
             
             # Train the modulation model
+            use_merged = args.use_merged_training and not args.no_merged_training
             stats = solver.train_on_dataset(
                 train_dataset, 
                 max_tasks=args.max_tasks,
-                save_interval=args.save_interval
+                save_interval=args.save_interval,
+                use_merged_training=use_merged
             )
             
             # Save final model
